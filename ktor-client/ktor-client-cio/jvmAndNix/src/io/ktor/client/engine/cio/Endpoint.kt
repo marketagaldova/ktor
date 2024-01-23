@@ -37,6 +37,8 @@ internal class Endpoint(
     private val deliveryPoint: Channel<RequestTask> = Channel()
     private val maxEndpointIdleTime: Long = 2 * config.endpoint.connectTimeout
 
+    private var address: InetSocketAddress? = null
+
     private val timeout = launch(coroutineContext + CoroutineName("Endpoint timeout($host:$port)")) {
         try {
             while (true) {
@@ -98,8 +100,16 @@ internal class Endpoint(
     ): HttpResponseData {
         try {
             val connection = connect(request)
-            val input = this@Endpoint.mapEngineExceptions(connection.input, request)
-            val originOutput = this@Endpoint.mapEngineExceptions(connection.output, request)
+            val input: ByteReadChannel
+            val originOutput: ByteWriteChannel
+            try {
+                input = this@Endpoint.mapEngineExceptions(connection.input, request)
+                originOutput = this@Endpoint.mapEngineExceptions(connection.output, request)
+            } catch (e: Throwable) {
+                PatchLogger.log("Releasing leaked connection after an error (2): ${e.stackTraceToString()}")
+                releaseConnection()
+                throw e
+            }
 
             val output = originOutput.handleHalfClosed(
                 callContext,
@@ -112,8 +122,11 @@ internal class Endpoint(
                     input.cancel(originCause)
                     originOutput.close(originCause)
                     connection.socket.close()
-                    releaseConnection()
-                } catch (_: Throwable) {
+                }
+                catch (_: Throwable) { /* pass */ }
+                finally {
+                    try { releaseConnection() }
+                    catch (e: Throwable) { PatchLogger.log("Failed to release connection: ${e.stackTraceToString()}") }
                 }
             }
 
@@ -201,7 +214,7 @@ internal class Endpoint(
 
         try {
             repeat(connectAttempts) {
-                val address = InetSocketAddress(host, port)
+                val address = InetSocketAddress(host, port).also { this.address = it }
 
                 val connect: suspend CoroutineScope.() -> Socket = {
                     connectionFactory.connect(address) {
@@ -221,8 +234,13 @@ internal class Endpoint(
                     }
                 }
 
-                val connection = socket.connection()
-                if (!secure) return@connect connection
+                val connection =
+                    try { socket.connection().also { if (!secure) return@connect it } }
+                    catch (e: Throwable) {
+                        PatchLogger.log("Releasing leaked connection after an error (1): ${e.stackTraceToString()}")
+                        connectionFactory.release(address)
+                        throw e
+                    }
 
                 try {
                     if (proxy?.type == ProxyType.HTTP) {
@@ -284,8 +302,7 @@ internal class Endpoint(
     }
 
     private fun releaseConnection() {
-        val address = InetSocketAddress(host, port)
-        connectionFactory.release(address)
+        address?.let { connectionFactory.release(it) }
         connections.decrementAndGet()
     }
 
